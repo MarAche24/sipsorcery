@@ -248,7 +248,12 @@ namespace SIPSorcery.Media
                         {
                             uint fps = (_frameSpacing > 0) ? 1000 / (uint)_frameSpacing : DEFAULT_FRAMES_PER_SECOND;
                             uint durationRtpTS = VIDEO_SAMPLING_RATE / fps;
-                            OnVideoSourceEncodedSample.Invoke(durationRtpTS, encodedBuffer);
+                            // Use ?.Invoke so the null-check and the call are
+                            // a single atomic delegate read. Without this a
+                            // subscriber unsubscribing on another thread
+                            // between the outer null-check and this Invoke
+                            // produced a NullReferenceException.
+                            OnVideoSourceEncodedSample?.Invoke(durationRtpTS, encodedBuffer);
                         }
                     }
 
@@ -267,7 +272,9 @@ namespace SIPSorcery.Media
         /// <param name="i420Buffer">The I420 buffer representing the test pattern.</param>
         private void GenerateRawSample(int width, int height, byte[] i420Buffer)
         {
+#pragma warning disable CS0618 // Type or member is obsolete
             var bgr = PixelConverter.I420toBGR(i420Buffer, width, height, out _);
+#pragma warning restore CS0618 // Type or member is obsolete
             OnVideoSourceRawSample?.Invoke((uint)_frameSpacing, width, height, bgr, VideoPixelFormatsEnum.Bgr);
         }
 

@@ -15,6 +15,7 @@
 
 using System;
 using System.Net;
+using System.Text;
 using Microsoft.Extensions.Logging;
 using SIPSorcery.Sys;
 
@@ -31,9 +32,12 @@ namespace SIPSorcery.SIP
     public enum SIPDialogueTransferModesEnum
     {
         Default = 0,
+        [Obsolete("The user agent classes, such as SIPUserAgent, should always prioritise their own transfer acceptance decisions making this option redundant.")] 
         PassThru = 1,           // REFER requests will be treated as an in-dialogue request and passed through to user agents.
         NotAllowed = 2,         // REFER requests will be blocked.
+        [Obsolete("Use the Allowed option instead. Blind transfers should not be considered more or less secure than attended transfers.")]
         BlindPlaceCall = 3,     // REFER requests without a replaces parameter will initiate a new call.
+        Allowed = 4,            // REFER requests will be allowed (note there is no security advantage for allowing only blind transfers as attended transfers still place an outbound call).
     }
 
     /// <summary>
@@ -83,24 +87,28 @@ namespace SIPSorcery.SIP
         {
             get
             {
-                string dialogueName = "L(??)";
-                if (LocalUserField != null && !LocalUserField.URI.User.IsNullOrBlank())
+                var dialogueNameBuilder = new StringBuilder();
+                if (LocalUserField?.URI is { } localUserFieldUri && !localUserFieldUri.User.IsNullOrBlank())
                 {
-                    dialogueName = "L(" + LocalUserField.URI.ToString() + ")";
-                }
-
-                dialogueName += "-";
-
-                if (RemoteUserField != null && !RemoteUserField.URI.User.IsNullOrBlank())
-                {
-                    dialogueName += "R(" + RemoteUserField.URI.ToString() + ")";
+                    dialogueNameBuilder.Append("L(").Append(localUserFieldUri).Append(')');
                 }
                 else
                 {
-                    dialogueName += "R(??)";
+                    dialogueNameBuilder.Append("L(??)");
                 }
 
-                return dialogueName;
+                dialogueNameBuilder.Append("-");
+
+                if (RemoteUserField?.URI is { } remoteUserFieldUri && !remoteUserFieldUri.User.IsNullOrBlank())
+                {
+                    dialogueNameBuilder.Append("R(").Append(remoteUserFieldUri).Append(')');
+                }
+                else
+                {
+                    dialogueNameBuilder.Append("R(??)");
+                }
+
+                return dialogueNameBuilder.ToString();
             }
         }
 

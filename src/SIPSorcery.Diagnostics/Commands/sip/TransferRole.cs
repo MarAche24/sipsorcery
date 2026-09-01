@@ -102,6 +102,41 @@ public sealed class RoleMedia : IDisposable
     /// <summary>Every remote end point that has delivered audio, with its packet tally.</summary>
     public IReadOnlyDictionary<string, RtpStreamStats> AudioByRemote => _audioByRemote;
 
+    /// <summary>
+    /// Stops and restarts the tone this role is sending.
+    /// </summary>
+    /// <remarks>
+    /// Used across a transfer. Both parties to one put their existing call on hold for a moment
+    /// while the new call is set up, which leaves the RTP session refusing to send, and a source
+    /// that keeps generating logs a warning for every packet it offers in that window.
+    ///
+    /// Pausing removes the noise without hiding anything: a send refused outside the window still
+    /// warns, and that is the case actually worth seeing.
+    /// </remarks>
+    public Task PauseAsync()
+    {
+        if (_paused)
+        {
+            return Task.CompletedTask;
+        }
+
+        _paused = true;
+        return Session.AudioExtrasSource.PauseAudio();
+    }
+
+    public Task ResumeAsync()
+    {
+        if (!_paused)
+        {
+            return Task.CompletedTask;
+        }
+
+        _paused = false;
+        return Session.AudioExtrasSource.ResumeAudio();
+    }
+
+    private bool _paused;
+
     public int TotalAudioPackets => _audioByRemote.Values.Sum(x => x.Packets);
 
     /// <summary>
@@ -110,6 +145,20 @@ public sealed class RoleMedia : IDisposable
     /// </summary>
     public KeyValuePair<string, RtpStreamStats>? DominantAudioRemote =>
         _audioByRemote.IsEmpty ? null : _audioByRemote.MaxBy(x => x.Value.Packets);
+
+    /// <summary>
+    /// The packet tally for every remote end point at this instant, for comparison against a later
+    /// one.
+    /// </summary>
+    /// <remarks>
+    /// Cumulative totals cannot answer "who is being heard NOW", which is the only question a
+    /// transfer turns on. The library reuses this media session for the call it places after a
+    /// REFER, so the pre-transfer party keeps every packet it ever sent, and a short post-transfer
+    /// window never overtakes a long call: the party that has been dropped stays the largest tally
+    /// indefinitely. Differencing two snapshots gives per end point rates, which do answer it.
+    /// </remarks>
+    public IReadOnlyDictionary<string, int> SnapshotAudioPacketCounts() =>
+        _audioByRemote.ToDictionary(x => x.Key, x => x.Value.Packets);
 
     private void OnRtpPacketReceived(IPEndPoint remoteEndPoint, SDPMediaTypesEnum mediaType, RTPPacket rtpPacket)
     {
@@ -137,6 +186,10 @@ public sealed class TransferRole : IDisposable
     private readonly TransferRoleOptions _options;
     private readonly ILogger _logger;
     private readonly SIPRegistrationUserAgent _registration;
+    private bool _unregistered;
+
+    /// <summary>How long to let the zero expiry REGISTER get away before the transport closes.</summary>
+    private static readonly TimeSpan UNREGISTER_SETTLE = TimeSpan.FromMilliseconds(600);
     private readonly TaskCompletionSource<(bool Success, string? Error)> _registrationOutcome =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -183,6 +236,12 @@ public sealed class TransferRole : IDisposable
         // callee's address of record, which is how a real phone with a configured proxy behaves and
         // keeps the server's routing under test rather than bypassed.
         UserAgent = new SIPUserAgent(Transport, options.OutboundProxy);
+
+        // Being held is the commonest reason this role's session stops accepting sends, and it is
+        // the far end's decision, so it is watched rather than predicted. Covers the transferor
+        // above all: both the transferee and the target hold it during a transfer, and its tone
+        // would otherwise warn on every packet for the whole of both windows.
+        PauseAudioWhileHeld(UserAgent, () => Media);
 
         // IPAddress.Any is substituted with the real send-from address by SIPTransport at send
         // time. The transport parameter has to be set here rather than left to that substitution:
@@ -283,6 +342,8 @@ public sealed class TransferRole : IDisposable
         ConsultationAgent = new SIPUserAgent(Transport, _options.OutboundProxy);
         ConsultationMedia = new RoleMedia($"{Name}-consult", _options.AudioSource, _logger);
 
+        PauseAudioWhileHeld(ConsultationAgent, () => ConsultationMedia);
+
         return (ConsultationAgent, ConsultationMedia);
     }
 
@@ -314,16 +375,50 @@ public sealed class TransferRole : IDisposable
         };
     }
 
+    /// <summary>
+    /// Pauses a call's audio for as long as the far end has it on hold.
+    /// </summary>
+    /// <remarks>
+    /// A held session refuses to send, and a source that keeps generating logs a warning for every
+    /// packet it offers. Tying this to the hold itself rather than to a guessed window means a
+    /// send refused for any other reason is still reported, which is the case worth seeing.
+    /// </remarks>
+    private void PauseAudioWhileHeld(SIPUserAgent agent, Func<RoleMedia?> media)
+    {
+        agent.RemotePutOnHold += () =>
+        {
+            _logger.LogDebug("{Role} was put on hold; pausing its audio.", Name);
+            _ = media()?.PauseAsync();
+        };
+
+        agent.RemoteTookOffHold += () =>
+        {
+            _logger.LogDebug("{Role} was taken off hold; resuming its audio.", Name);
+            _ = media()?.ResumeAsync();
+        };
+    }
+
     /// <summary>Removes the registration with a zero expiry re-register and waits briefly for it.</summary>
     public async Task UnregisterAsync()
     {
-        if (!Registered)
+        // Idempotent because this is called from the scenario's finally block, which also runs
+        // after the paths that already unregistered on their way out.
+        if (!Registered || _unregistered)
         {
             return;
         }
 
+        _unregistered = true;
+
+        _logger.LogDebug("Removing the registration for {Role} ({Aor}).", Name, Aor);
+
         _registration.Stop();
-        await Task.Delay(TimeSpan.FromMilliseconds(250), CancellationToken.None).ConfigureAwait(false);
+
+        // Long enough for the zero expiry REGISTER to make it out over a WAN round trip before the
+        // transport is torn down. Leaving a binding behind is not cosmetic: it points at a port
+        // that dies with this process, and the registrar will keep offering it to callers until it
+        // expires, so the NEXT run of this command gets its calls routed into a black hole.
+        await Task.Delay(UNREGISTER_SETTLE, CancellationToken.None).ConfigureAwait(false);
     }
 
     /// <summary>

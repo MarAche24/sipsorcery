@@ -52,6 +52,13 @@ public sealed class SipTransferCommand : CommandBase
     private const string BlindMode = "blind";
     private const string AttendedMode = "attended";
 
+    /// <summary>
+    /// Packets an end point must deliver AFTER the REFER before it counts as the party the
+    /// transferee is now hearing. At a 20ms packetisation this is a fifth of a second of audio,
+    /// which is enough to tell a conversation from a straggler off the old leg.
+    /// </summary>
+    private const int MEDIA_SWITCH_MINIMUM_PACKETS = 10;
+
     private const int DEFAULT_CALL_DURATION_SECONDS = 5;
 
     /// <summary>
@@ -97,6 +104,7 @@ public sealed class SipTransferCommand : CommandBase
         long? CallDurationMs,
         MediaLeg? TransferorMedia,
         MediaLeg? TransfereeMedia,
+        MediaLeg? TargetMedia,
         IReadOnlyList<TimelineEvent> Timeline,
         string? Error,
         TransferOutcome? Transfer = null);
@@ -117,6 +125,8 @@ public sealed class SipTransferCommand : CommandBase
         string? MediaBefore,
         string? MediaAfter,
         string? MediaSwitched,
+        int PacketsFromNewPartyAfterRefer,
+        int PacketsFromOriginalPartyAfterRefer,
         IReadOnlyList<string> Notifies);
 
     /// <summary>Collects the scenario steps with a millisecond offset from the start of the run.</summary>
@@ -382,7 +392,7 @@ public sealed class SipTransferCommand : CommandBase
 
                 return WriteResult(asJson,
                     new TransferResult(false, mode, protocol.ToString(), serverUri.ToString(), domain,
-                        roleResults, false, null, null, null, null, timeline.Events,
+                        roleResults, false, null, null, null, null, null, timeline.Events,
                         $"Registration failed for: {failed}."),
                     ExitCodes.Failed);
             }
@@ -416,7 +426,70 @@ public sealed class SipTransferCommand : CommandBase
                 descriptor.Password = parsed[1].Password;
                 descriptor.From = transfereeRole.Aor.ToString();
 
+                Console.Error.WriteLine($"Transferee is calling the target at {descriptor.Uri}.");
                 timeline.Add("transfereeCallingTarget", detail: descriptor.Uri);
+            };
+
+            // The transferee's side of the transfer, which the library does raise events for.
+            transfereeRole.UserAgent.OnTransferRequested += (referTo, referredBy) =>
+            {
+                Console.Error.WriteLine(
+                    $"Transferee was asked to transfer the call to {referTo.URI.ToParameterlessString()}" +
+                    (string.IsNullOrWhiteSpace(referredBy) ? "" : $" by {referredBy}") + " - accepting.");
+
+                timeline.Add("transfereeAcceptedRefer", detail: referTo.URI.ToParameterlessString());
+
+                // Silenced for the transfer: the transferee holds the transferor while it calls
+                // the target, and a tone playing into a session that will not send warns on every
+                // packet.
+                _ = transfereeRole.Media?.PauseAsync();
+
+                // Returning true is what accepts it; with no handler at all the library accepts
+                // anyway, so this changes nothing beyond making the decision visible.
+                return true;
+            };
+
+            transfereeRole.UserAgent.OnTransferToTargetSuccessful += referTo =>
+            {
+                Console.Error.WriteLine(
+                    $"Transferee reached {referTo.URI.ToParameterlessString()}; its call to the transferor is done.");
+                timeline.Add("transfereeReachedTarget");
+
+                _ = transfereeRole.Media?.ResumeAsync();
+            };
+
+            transfereeRole.UserAgent.OnTransferToTargetFailed += referTo =>
+            {
+                Console.Error.WriteLine(
+                    $"Transferee could not reach {referTo.URI.ToParameterlessString()}; the transfer failed.");
+                timeline.Add("transfereeFailedToReachTarget");
+
+                _ = transfereeRole.Media?.ResumeAsync();
+            };
+
+            // The target's side of it. Between these two the call being replaced is on hold, which
+            // is where the RecvOnly warnings from the audio source come from.
+            targetRole.UserAgent.OnAttendedTransferRequested += request =>
+            {
+                var replaced = SIPReplacesParameter.Parse(request.Header.Replaces)?.CallID;
+
+                Console.Error.WriteLine(
+                    $"Target is being asked to replace call {replaced} - putting it on hold and " +
+                    "answering the call taking it over.");
+
+                timeline.Add("targetReplacingCall", detail: replaced);
+
+                _ = targetRole.Media?.PauseAsync();
+            };
+
+            targetRole.UserAgent.OnAttendedTransferAccepted += replaced =>
+            {
+                Console.Error.WriteLine(
+                    $"Target accepted the transfer; its call {replaced.CallId} to the transferor is done.");
+
+                timeline.Add("targetAcceptedTransfer", detail: replaced.CallId);
+
+                _ = targetRole.Media?.ResumeAsync();
             };
 
             // Recorded rather than required. The transferee's own REFER handling in the library
@@ -447,7 +520,14 @@ public sealed class SipTransferCommand : CommandBase
                 failureResponse = resp;
                 Console.Error.WriteLine($"Call failed: {error}.");
             };
-            transferorRole.UserAgent.OnCallHungup += _ => remoteHungup.TrySetResult(true);
+            transferorRole.UserAgent.OnCallHungup += _ =>
+            {
+                // After a transfer this is the transferee letting the transferor go, which is the
+                // half of the outcome the transferor can actually observe.
+                Console.Error.WriteLine("Transferor's call to the transferee has been hung up.");
+                timeline.Add("originalLegHungup");
+                remoteHungup.TrySetResult(true);
+            };
 
             Console.Error.WriteLine($"Transferor calling transferee at {transfereeRole.Aor} ...");
 
@@ -473,7 +553,7 @@ public sealed class SipTransferCommand : CommandBase
 
                 return WriteResult(asJson,
                     new TransferResult(false, mode, protocol.ToString(), serverUri.ToString(), domain,
-                        roleResults, false, connectTimeMs, null, null, null, timeline.Events,
+                        roleResults, false, connectTimeMs, null, null, null, null, timeline.Events,
                         statusCode != null
                             ? $"The transferee did not answer: {statusCode} {failureResponse!.ReasonPhrase}."
                             : $"The transferee did not answer within {timeoutSeconds}s."),
@@ -492,6 +572,8 @@ public sealed class SipTransferCommand : CommandBase
             // it is the whole point: the library hands the same media session to the new call, so
             // packet counts carry straight through and only the remote end point actually changes.
             var mediaBefore = transfereeRole.Media?.DominantAudioRemote?.Key;
+            var mediaBaseline = transfereeRole.Media?.SnapshotAudioPacketCounts()
+                ?? new Dictionary<string, int>();
             bool baselineMedia = transferorRole.Media is { TotalAudioPackets: > 0 }
                 && transfereeRole.Media is { TotalAudioPackets: > 0 };
 
@@ -514,6 +596,8 @@ public sealed class SipTransferCommand : CommandBase
                 // replacement. Nothing else tells the transferor the transfer landed.
                 agent.OnCallHungup += _ =>
                 {
+                    Console.Error.WriteLine(
+                        "Transferor's call to the target has been hung up - the target took the replacement.");
                     timeline.Add("consultationReplaced");
                     consultationReplaced.TrySetResult(true);
                 };
@@ -534,7 +618,8 @@ public sealed class SipTransferCommand : CommandBase
                     return WriteResult(asJson,
                         new TransferResult(false, mode, protocol.ToString(), serverUri.ToString(), domain,
                             roleResults, true, connectTimeMs, callWindow.ElapsedMilliseconds,
-                            Describe(transferorRole.Media), Describe(transfereeRole.Media), timeline.Events,
+                            Describe(transferorRole.Media), Describe(transfereeRole.Media),
+                            Describe(targetRole.Media), timeline.Events,
                             "The consultation call to the target was not answered."),
                         ExitCodes.Failed);
                 }
@@ -596,6 +681,10 @@ public sealed class SipTransferCommand : CommandBase
                 await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
             }
 
+            Console.Error.WriteLine(attended
+                ? "Both of the transferor's calls should now be gone; the transferee and target are talking."
+                : "The transferor's call should now be gone; the transferee and target are talking.");
+
             bool targetAnswered = attended
                 ? consultationReplaced.Task.IsCompletedSuccessfully
                 : targetCalled.Task.IsCompletedSuccessfully;
@@ -605,7 +694,30 @@ public sealed class SipTransferCommand : CommandBase
                 timeline.Add("targetAnswered");
             }
 
-            var mediaAfter = transfereeRole.Media?.DominantAudioRemote?.Key;
+            // Who the transferee is hearing SINCE the REFER, by differencing the tallies against
+            // the baseline taken above. Cumulative dominance cannot answer this: the media session
+            // is reused across the transfer, so the transferor keeps the packets it sent during
+            // the whole pre-transfer call and a target answering seconds before the end never
+            // overtakes it. Comparing totals therefore reports "the audio did not move" on a
+            // transfer whose media moved perfectly.
+            var mediaNow = transfereeRole.Media?.SnapshotAudioPacketCounts()
+                ?? new Dictionary<string, int>();
+
+            var sinceRefer = mediaNow.ToDictionary(
+                x => x.Key,
+                x => x.Value - (mediaBaseline.TryGetValue(x.Key, out int before) ? before : 0));
+
+            // A handful of packets is a straggler from the old leg or a probe, not a conversation.
+            var busiest = sinceRefer
+                .Where(x => x.Value >= MEDIA_SWITCH_MINIMUM_PACKETS)
+                .OrderByDescending(x => x.Value)
+                .Cast<KeyValuePair<string, int>?>()
+                .FirstOrDefault();
+
+            var mediaAfter = busiest?.Key;
+            int packetsFromNewParty = busiest?.Value ?? 0;
+            int packetsFromOriginalParty =
+                mediaBefore != null && sinceRefer.TryGetValue(mediaBefore, out int original) ? original : 0;
 
             // Three-valued on purpose. "The audio did not move" and "there was never any audio to
             // move" are different findings, and reporting the second as the first would blame the
@@ -634,6 +746,20 @@ public sealed class SipTransferCommand : CommandBase
             var transferorLeg = Describe(transferorRole.Media);
             var transfereeLeg = Describe(transfereeRole.Media);
 
+            // The surviving call after a transfer is the transferee and the target, so the
+            // target's side of it is half the evidence for whether the media actually moved.
+            var targetLeg = Describe(targetRole.Media);
+
+            // The consultation is a real leg of an attended transfer and the only place the
+            // target's audio can be seen before the transfer, which separates "the target stopped
+            // sending when it was taken over" from "the target never sent at all".
+            if (attended)
+            {
+                var consultLeg = Describe(transferorRole.ConsultationMedia);
+                Console.Error.WriteLine(
+                    $"  consultation: transferor heard {(consultLeg is null or { Packets: 0 } ? "nothing" : $"{consultLeg.Packets} packets from {consultLeg.RemoteEndPoint}")} from the target.");
+            }
+
             await HangUpAllAsync(roles).ConfigureAwait(false);
 
             timeline.Add("callEnded");
@@ -655,6 +781,8 @@ public sealed class SipTransferCommand : CommandBase
                 mediaBefore,
                 mediaAfter,
                 mediaSwitched,
+                packetsFromNewParty,
+                packetsFromOriginalParty,
                 notified);
 
             // The transfer is judged on what it achieved, and media only counts against it when
@@ -675,7 +803,7 @@ public sealed class SipTransferCommand : CommandBase
             return WriteResult(asJson,
                 new TransferResult(transferred, mode, protocol.ToString(), serverUri.ToString(), domain,
                     roleResults, true, connectTimeMs, callWindow.ElapsedMilliseconds,
-                    transferorLeg, transfereeLeg, timeline.Events, error, outcome),
+                    transferorLeg, transfereeLeg, targetLeg, timeline.Events, error, outcome),
                 transferred ? ExitCodes.Ok : ExitCodes.Failed);
         }
         catch (OperationCanceledException)
@@ -693,6 +821,16 @@ public sealed class SipTransferCommand : CommandBase
             // ringing on the server. Idempotent with the tidy path above: a role whose call has
             // already ended sends nothing.
             await HangUpAllAsync(roles).ConfigureAwait(false);
+
+            // Removing the bindings has to happen here rather than only on the path that
+            // succeeded. Every role registers a Contact on an ephemeral port that stops existing
+            // when this process does, so a run that returns early - a call that was never
+            // answered, a REFER that was refused, a cancellation - used to leave three live
+            // bindings behind for the full registration expiry. The next run registers from new
+            // ports, and until the stale ones age out the server has a choice of bindings for each
+            // account and some of them are black holes. That made consecutive runs of this command
+            // disagree with each other, which looked like server flakiness and was not.
+            await Task.WhenAll(roles.Select(x => x.UnregisterAsync())).ConfigureAwait(false);
 
             foreach (var role in roles)
             {
@@ -796,7 +934,7 @@ public sealed class SipTransferCommand : CommandBase
         bool asJson, string server, string mode, string error, Timeline timeline, int exitCode) =>
         WriteResult(asJson,
             new TransferResult(false, mode, string.Empty, server, string.Empty, Array.Empty<RoleResult>(),
-                false, null, null, null, null, timeline.Events, error),
+                false, null, null, null, null, null, timeline.Events, error),
             exitCode);
 
     private static int WriteResult(bool asJson, TransferResult result, int exitCode)
@@ -820,6 +958,18 @@ public sealed class SipTransferCommand : CommandBase
                 Console.WriteLine($"  call answered in {result.ConnectTimeMs}ms, held {result.CallDurationMs}ms");
                 WriteLeg("transferor heard", result.TransferorMedia);
                 WriteLeg("transferee heard", result.TransfereeMedia);
+                WriteLeg("target     heard", result.TargetMedia);
+
+                // The lines above are lifetime totals, which for the transferee spans both sides of
+                // the transfer and is dominated by whichever call ran longest. Who it is hearing
+                // after the REFER is the separate - and for a transfer, the deciding - question.
+                if (result.Transfer is { MediaSwitched: not null and not "not-assessed" } transfer)
+                {
+                    Console.WriteLine(
+                        $"  since the REFER   {transfer.PacketsFromNewPartyAfterRefer} packets from " +
+                        $"{transfer.MediaAfter ?? "nobody"} (new), " +
+                        $"{transfer.PacketsFromOriginalPartyAfterRefer} from {transfer.MediaBefore ?? "nobody"} (original)");
+                }
             }
 
             if (result.Error != null)
